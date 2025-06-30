@@ -8,6 +8,7 @@ use solana_sdk::{
 use spl_token::instruction as token_instruction;
 use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::env;
 
 
 #[derive(Serialize)]
@@ -432,12 +433,17 @@ async fn transfer_tokens(req: TokenTransferRequest) -> Result<impl warp::Reply, 
 
 #[tokio::main]
 async fn main() {
-    println!("Starting  HTTP Server...");
+    println!("Starting Server...");
+    
+    let port = env::var("PORT")
+        .unwrap_or_else(|_| "3030".to_string())
+        .parse::<u16>()
+        .expect("PORT must be a valid number");
     
     let cors = warp::cors()
         .allow_any_origin()
-        .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST"]);
+        .allow_headers(vec!["content-type", "authorization"])
+        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
     
     let generate_keypair_route = warp::path("generate-keypair")
         .and(warp::post())
@@ -482,9 +488,8 @@ async fn main() {
         .or(transfer_tokens_route)
         .with(cors);
     
-    println!("Server running on http://localhost:3030");
-    
+
     warp::serve(routes)
-        .run(([127, 0, 0, 1], 3030))
+        .run(([0, 0, 0, 0], port))
         .await;
 }

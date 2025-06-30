@@ -1,0 +1,1 @@
+web: ./target/release/superdev-assignment
