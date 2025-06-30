@@ -2323,6 +2323,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana_http_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "bs58",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "solana-sdk",
+ "spl-associated-token-account",
+ "spl-token",
+ "tokio",
+ "warp",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2552,22 +2569,6 @@ name = "subtle"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bdef32e8150c2a081110b42772ffe7d7c9032b606bc226c8260fd97e0976601"
-
-[[package]]
-name = "superdev-assignment"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "bs58",
- "serde",
- "serde_json",
- "solana-sdk",
- "spl-associated-token-account",
- "spl-token",
- "tokio",
- "warp",
-]
 
 [[package]]
 name = "syn"

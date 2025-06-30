@@ -2,26 +2,30 @@ use warp::Filter;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{Keypair, Signer, Signature},
     system_instruction,
 };
 use spl_token::instruction as token_instruction;
+use spl_associated_token_account;
 use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bs58;
 use std::env;
 
 
 #[derive(Serialize)]
-struct ApiResponse {
+struct ApiResponse<T> {
     success: bool,
-    data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 #[derive(Serialize)]
-struct WalletData {
-    public_key: String,
-    secret_key: String,
+struct KeypairData {
+    pubkey: String,
+    secret: String,
 }
 
 #[derive(Serialize)]
@@ -46,106 +50,138 @@ struct SignatureData {
 }
 
 #[derive(Serialize)]
-struct VerifyResult {
-    is_valid: bool,
+struct VerifyData {
+    valid: bool,
     message: String,
-    signer: String,
+    pubkey: String,
 }
 
 #[derive(Serialize)]
-struct TransferData {
+struct SolTransferData {
     program_id: String,
     accounts: Vec<String>,
-    data: String,
+    instruction_data: String,
 }
 
-// Input structures
+#[derive(Serialize)]
+struct TokenTransferData {
+    program_id: String,
+    accounts: Vec<TokenAccountInfo>,
+    instruction_data: String,
+}
+
+#[derive(Serialize)]
+struct TokenAccountInfo {
+    pubkey: String,
+    #[serde(rename = "isSigner")]
+    is_signer: bool,
+}
+
+
 #[derive(Deserialize)]
 struct CreateTokenRequest {
     #[serde(rename = "mintAuthority")]
     mint_authority: String,
+    mint: String,
     decimals: u8,
 }
 
 #[derive(Deserialize)]
-struct MintRequest {
+struct MintTokenRequest {
     mint: String,
-    to: String,
-    amount: u64,
+    destination: String,
     authority: String,
+    amount: u64,
 }
 
 #[derive(Deserialize)]
-struct SignRequest {
+struct SignMessageRequest {
     message: String,
-    private_key: String,
+    secret: String,
 }
 
 #[derive(Deserialize)]
-struct VerifyRequest {
+struct VerifyMessageRequest {
     message: String,
     signature: String,
-    public_key: String,
+    pubkey: String,
 }
 
 #[derive(Deserialize)]
-struct SolTransferRequest {
+struct SendSolRequest {
     from: String,
     to: String,
     lamports: u64,
 }
 
 #[derive(Deserialize)]
-struct TokenTransferRequest {
-    source: String,
+struct SendTokenRequest {
     destination: String,
+    mint: String,
     owner: String,
     amount: u64,
 }
 
 
+type ApiResult = Result<Box<dyn warp::Reply>, warp::Rejection>;
 
-async fn generate_keypair() -> Result<impl warp::Reply, warp::Rejection> {
-    let keypair = Keypair::new();
-    let wallet_data = WalletData {
-        public_key: keypair.pubkey().to_string(),
-        secret_key: STANDARD.encode(&keypair.to_bytes()),
-    };
-    
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&wallet_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+fn success_response<T: Serialize>(data: T) -> Box<dyn warp::Reply> {
+    Box::new(warp::reply::with_status(
+        warp::reply::json(&ApiResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        }),
+        warp::http::StatusCode::OK,
+    ))
 }
 
-async fn create_token(req: CreateTokenRequest) -> Result<impl warp::Reply, warp::Rejection> {
-    let mint_authority = match Pubkey::from_str(&req.mint_authority) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid mint authority".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+fn error_response(message: &str) -> Box<dyn warp::Reply> {
+    Box::new(warp::reply::with_status(
+        warp::reply::json(&ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(message.to_string()),
+        }),
+        warp::http::StatusCode::BAD_REQUEST,
+    ))
+}
+
+async fn generate_keypair() -> ApiResult {
+    let keypair = Keypair::new();
+    
+    let response_data = KeypairData {
+        pubkey: keypair.pubkey().to_string(),
+        secret: bs58::encode(&keypair.to_bytes()).into_string(),
     };
     
-    let mint_keypair = Keypair::new();
-    let mint_pubkey = mint_keypair.pubkey();
+    Ok(success_response(response_data))
+}
+
+async fn create_token(req: CreateTokenRequest) -> ApiResult {
     
-    let instruction = token_instruction::initialize_mint(
+    let mint_authority = match Pubkey::from_str(&req.mint_authority) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid mint authority address")),
+    };
+    
+    let mint_pubkey = match Pubkey::from_str(&req.mint) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid mint address")),
+    };
+    
+    let instruction = match token_instruction::initialize_mint(
         &spl_token::id(),
         &mint_pubkey,
         &mint_authority,
-        None,
+        None, 
         req.decimals,
-    ).unwrap();
+    ) {
+        Ok(instruction) => instruction,
+        Err(_) => return Ok(error_response("Failed to create mint instruction")),
+    };
     
-    let instruction_data = InstructionData {
+    let response_data = InstructionData {
         program_id: spl_token::id().to_string(),
         accounts: vec![
             AccountInfo {
@@ -154,70 +190,49 @@ async fn create_token(req: CreateTokenRequest) -> Result<impl warp::Reply, warp:
                 is_writable: true,
             },
             AccountInfo {
-                pubkey: mint_authority.to_string(),
-                is_signer: true,
+                pubkey: solana_sdk::sysvar::rent::id().to_string(),
+                is_signer: false,
                 is_writable: false,
             },
         ],
         instruction_data: STANDARD.encode(&instruction.data),
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&instruction_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
 
-async fn mint_tokens(req: MintRequest) -> Result<impl warp::Reply, warp::Rejection> {
+
+async fn mint_token(req: MintTokenRequest) -> ApiResult {
+    // Validate all addresses
     let mint = match Pubkey::from_str(&req.mint) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid mint address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid mint address")),
     };
     
-    let to = match Pubkey::from_str(&req.to) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid destination address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+    let destination = match Pubkey::from_str(&req.destination) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid destination address")),
     };
     
     let authority = match Pubkey::from_str(&req.authority) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid authority address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid authority address")),
     };
     
-    let instruction = token_instruction::mint_to(
+  
+    let instruction = match token_instruction::mint_to(
         &spl_token::id(),
         &mint,
-        &to,
+        &destination,
         &authority,
         &[],
         req.amount,
-    ).unwrap();
+    ) {
+        Ok(instruction) => instruction,
+        Err(_) => return Ok(error_response("Failed to create mint instruction")),
+    };
     
-    let instruction_data = InstructionData {
+    let response_data = InstructionData {
         program_id: spl_token::id().to_string(),
         accounts: vec![
             AccountInfo {
@@ -226,7 +241,7 @@ async fn mint_tokens(req: MintRequest) -> Result<impl warp::Reply, warp::Rejecti
                 is_writable: true,
             },
             AccountInfo {
-                pubkey: to.to_string(),
+                pubkey: destination.to_string(),
                 is_signer: false,
                 is_writable: true,
             },
@@ -239,256 +254,224 @@ async fn mint_tokens(req: MintRequest) -> Result<impl warp::Reply, warp::Rejecti
         instruction_data: STANDARD.encode(&instruction.data),
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&instruction_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
 
-async fn sign_message(req: SignRequest) -> Result<impl warp::Reply, warp::Rejection> {
-    let private_key_bytes = match STANDARD.decode(&req.private_key) {
+
+async fn sign_message(req: SignMessageRequest) -> ApiResult {
+    
+    let secret_bytes = match bs58::decode(&req.secret).into_vec() {
         Ok(bytes) => bytes,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid private key format".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Err(_) => return Ok(error_response("Invalid secret key format")),
     };
     
-    let keypair = match Keypair::from_bytes(&private_key_bytes) {
+ 
+    let keypair = match Keypair::from_bytes(&secret_bytes) {
         Ok(kp) => kp,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Could not create keypair".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Err(_) => return Ok(error_response("Invalid secret key")),
     };
     
+
     let message_bytes = req.message.as_bytes();
     let signature = keypair.sign_message(message_bytes);
     
-    let signature_data = SignatureData {
+    let response_data = SignatureData {
         signature: STANDARD.encode(signature.as_ref()),
         public_key: keypair.pubkey().to_string(),
         message: req.message,
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&signature_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
 
-async fn verify_signature(req: VerifyRequest) -> Result<impl warp::Reply, warp::Rejection> {
-    // For simplicity, we'll just check if signature format is valid
-    let is_valid = STANDARD.decode(&req.signature).is_ok() && 
-                   Pubkey::from_str(&req.public_key).is_ok();
+
+async fn verify_message(req: VerifyMessageRequest) -> ApiResult {
     
-    let verify_result = VerifyResult {
-        is_valid,
+    let pubkey = match Pubkey::from_str(&req.pubkey) {
+        Ok(pk) => pk,
+        Err(_) => return Ok(error_response("Invalid public key")),
+    };
+    
+    
+    let signature_bytes = match STANDARD.decode(&req.signature) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(error_response("Invalid signature format")),
+    };
+    
+    
+    let signature = match Signature::try_from(signature_bytes.as_slice()) {
+        Ok(sig) => sig,
+        Err(_) => return Ok(error_response("Invalid signature")),
+    };
+    
+    
+    let message_bytes = req.message.as_bytes();
+    let is_valid = signature.verify(&pubkey.to_bytes(), message_bytes);
+    
+    let response_data = VerifyData {
+        valid: is_valid,
         message: req.message,
-        signer: req.public_key,
+        pubkey: req.pubkey,
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&verify_result).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
 
-async fn transfer_sol(req: SolTransferRequest) -> Result<impl warp::Reply, warp::Rejection> {
+
+async fn send_sol(req: SendSolRequest) -> ApiResult {
+   
     let from = match Pubkey::from_str(&req.from) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid sender address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid from address")),
     };
     
     let to = match Pubkey::from_str(&req.to) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid recipient address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid to address")),
     };
     
+
+    if req.lamports == 0 {
+        return Ok(error_response("Lamports amount must be greater than 0"));
+    }
+    
+  
     let instruction = system_instruction::transfer(&from, &to, req.lamports);
     
-    let transfer_data = TransferData {
+    let response_data = SolTransferData {
         program_id: solana_sdk::system_program::id().to_string(),
         accounts: vec![req.from, req.to],
-        data: STANDARD.encode(&instruction.data),
+        instruction_data: STANDARD.encode(&instruction.data),
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&transfer_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
 
-async fn transfer_tokens(req: TokenTransferRequest) -> Result<impl warp::Reply, warp::Rejection> {
-    let source = match Pubkey::from_str(&req.source) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid source address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+
+async fn send_token(req: SendTokenRequest) -> ApiResult {
+   
+    let destination = match Pubkey::from_str(&req.destination) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid destination address")),
     };
     
-    let destination = match Pubkey::from_str(&req.destination) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid destination address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+    let mint = match Pubkey::from_str(&req.mint) {
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid mint address")),
     };
     
     let owner = match Pubkey::from_str(&req.owner) {
-        Ok(key) => key,
-        Err(_) => {
-            let response = ApiResponse {
-                success: false,
-                data: String::new(),
-                error: Some("Invalid owner address".to_string()),
-            };
-            return Ok(warp::reply::json(&response));
-        }
+        Ok(pubkey) => pubkey,
+        Err(_) => return Ok(error_response("Invalid owner address")),
     };
     
-    let instruction = token_instruction::transfer(
+    
+    if req.amount == 0 {
+        return Ok(error_response("Amount must be greater than 0"));
+    }
+    
+  
+    let source_ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+    let dest_ata = spl_associated_token_account::get_associated_token_address(&destination, &mint);
+    
+    
+    let instruction = match token_instruction::transfer(
         &spl_token::id(),
-        &source,
-        &destination,
+        &source_ata,
+        &dest_ata,
         &owner,
         &[],
         req.amount,
-    ).unwrap();
+    ) {
+        Ok(instruction) => instruction,
+        Err(_) => return Ok(error_response("Failed to create transfer instruction")),
+    };
     
-    let instruction_data = InstructionData {
+    let response_data = TokenTransferData {
         program_id: spl_token::id().to_string(),
         accounts: vec![
-            AccountInfo {
-                pubkey: source.to_string(),
+            TokenAccountInfo {
+                pubkey: source_ata.to_string(),
                 is_signer: false,
-                is_writable: true,
             },
-            AccountInfo {
-                pubkey: destination.to_string(),
+            TokenAccountInfo {
+                pubkey: dest_ata.to_string(),
                 is_signer: false,
-                is_writable: true,
             },
-            AccountInfo {
+            TokenAccountInfo {
                 pubkey: owner.to_string(),
                 is_signer: true,
-                is_writable: false,
             },
         ],
         instruction_data: STANDARD.encode(&instruction.data),
     };
     
-    let response = ApiResponse {
-        success: true,
-        data: serde_json::to_string(&instruction_data).unwrap_or_default(),
-        error: None,
-    };
-    
-    Ok(warp::reply::json(&response))
+    Ok(success_response(response_data))
 }
+
 
 
 #[tokio::main]
 async fn main() {
-    println!("Starting Server...");
-    
+    println!("🚀 Starting Solana HTTP Server...");
     let port = env::var("PORT")
         .unwrap_or_else(|_| "3030".to_string())
         .parse::<u16>()
-        .expect("PORT must be a valid number");
+        .unwrap_or(3030);
     
+  
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type", "authorization"])
         .allow_methods(vec!["GET", "POST", "OPTIONS"]);
     
-    let generate_keypair_route = warp::path("generate-keypair")
+   
+    let keypair_route = warp::path("keypair")
         .and(warp::post())
         .and_then(generate_keypair);
     
-    let create_token_route = warp::path("create-token")
+    let create_token_route = warp::path!("token" / "create")
         .and(warp::post())
         .and(warp::body::json())
         .and_then(create_token);
     
-    let mint_tokens_route = warp::path("mint-tokens")
+    let mint_token_route = warp::path!("token" / "mint")
         .and(warp::post())
         .and(warp::body::json())
-        .and_then(mint_tokens);
+        .and_then(mint_token);
     
-    let sign_message_route = warp::path("sign-message")
+    let sign_message_route = warp::path!("message" / "sign")
         .and(warp::post())
         .and(warp::body::json())
         .and_then(sign_message);
     
-    let verify_signature_route = warp::path("verify-signature")
+    let verify_message_route = warp::path!("message" / "verify")
         .and(warp::post())
         .and(warp::body::json())
-        .and_then(verify_signature);
+        .and_then(verify_message);
     
-    let transfer_sol_route = warp::path("transfer-sol")
+    let send_sol_route = warp::path!("send" / "sol")
         .and(warp::post())
         .and(warp::body::json())
-        .and_then(transfer_sol);
+        .and_then(send_sol);
     
-    let transfer_tokens_route = warp::path("transfer-tokens")
+    let send_token_route = warp::path!("send" / "token")
         .and(warp::post())
         .and(warp::body::json())
-        .and_then(transfer_tokens);
+        .and_then(send_token);
     
-    let routes = generate_keypair_route
+  
+    let routes = keypair_route
         .or(create_token_route)
-        .or(mint_tokens_route)
+        .or(mint_token_route)
         .or(sign_message_route)
-        .or(verify_signature_route)
-        .or(transfer_sol_route)
-        .or(transfer_tokens_route)
+        .or(verify_message_route)
+        .or(send_sol_route)
+        .or(send_token_route)
         .with(cors);
     
-
+ 
+    
     warp::serve(routes)
         .run(([0, 0, 0, 0], port))
         .await;

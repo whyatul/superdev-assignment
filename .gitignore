@@ -1,5 +1,3 @@
 /target
-.env
-*.log
-.DS_Store
+
 Cargo.lock
